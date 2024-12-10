@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"image"
+	"os"
 	"path/filepath"
 	"sync/atomic"
 	"time"
@@ -60,6 +61,8 @@ type videostore struct {
 
 	storagePath string
 	uploadPath  string
+
+	stats stats
 }
 
 type storage struct {
@@ -91,6 +94,19 @@ type Config struct {
 
 	// TODO(seanp): Remove once camera properties are returned from camera component.
 	Properties cameraProperties `json:"cam_props"`
+}
+
+type stats struct {
+	imagesFetched atomic.Int64
+	bytesReceived atomic.Int64
+
+	uploadVideoConcats  atomic.Int64
+	activeUploadConcats atomic.Int64
+
+	fetchVideoConcats  atomic.Int64
+	activeFetchConcats atomic.Int64
+
+	bytesConcated atomic.Int64
 }
 
 // Validate validates the configuration for the video storage camera component.
@@ -245,6 +261,24 @@ func newvideostore(
 
 	// Start workers to process frames and clean up storage.
 	vs.workers = utils.NewBackgroundStoppableWorkers(vs.fetchFrames, vs.processFrames, vs.deleter)
+	vs.workers.Add(func(ctx context.Context) {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(10 * time.Second):
+				logger.Infow("VideoStore metrics",
+					"imagesFetched", vs.stats.imagesFetched.Load(),
+					"bytesReceived", vs.stats.bytesReceived.Load(),
+					"uploadVideoConcats", vs.stats.uploadVideoConcats.Load(),
+					"activeUploadConcats", vs.stats.activeUploadConcats.Load(),
+					"fetchVideoConcats", vs.stats.fetchVideoConcats.Load(),
+					"activeFetchConcats", vs.stats.activeFetchConcats.Load(),
+					"bytesConcated", vs.stats.bytesConcated.Load(),
+				)
+			}
+		}
+	})
 
 	return vs, nil
 }
@@ -284,17 +318,34 @@ func (vs *videostore) DoCommand(_ context.Context, command map[string]interface{
 				"status":   "async",
 			}, nil
 		default:
+			vs.stats.activeUploadConcats.Add(1)
+			defer func() {
+				vs.stats.activeUploadConcats.Add(-1)
+				vs.stats.uploadVideoConcats.Add(1)
+			}()
+
 			err = vs.conc.concat(from, to, uploadFilePath)
 			if err != nil {
 				vs.logger.Error("failed to concat files ", err)
 				return nil, err
 			}
+
+			if info, err := os.Stat(uploadFilePath); err == nil {
+				vs.stats.bytesConcated.Add(info.Size())
+			}
+
 			return map[string]interface{}{
 				"command":  "save",
 				"filename": uploadFileName,
 			}, nil
 		}
 	case "fetch":
+		vs.stats.activeFetchConcats.Add(1)
+		defer func() {
+			vs.stats.activeFetchConcats.Add(-1)
+			vs.stats.fetchVideoConcats.Add(1)
+		}()
+
 		vs.logger.Debug("fetch command received")
 		from, to, err := validateFetchCommand(command)
 		if err != nil {
@@ -307,6 +358,7 @@ func (vs *videostore) DoCommand(_ context.Context, command map[string]interface{
 			return nil, err
 		}
 		videoSize, err := getFileSize(fetchFilePath)
+		vs.stats.bytesConcated.Add(videoSize)
 		if err != nil {
 			return nil, err
 		}
@@ -349,11 +401,13 @@ func (vs *videostore) fetchFrames(ctx context.Context) {
 			time.Sleep(retryInterval * time.Second)
 			continue
 		}
+		vs.stats.imagesFetched.Add(1)
 		lazyImage, ok := frame.(*rimage.LazyEncodedImage)
 		if !ok {
 			vs.logger.Error("frame is not of type *rimage.LazyEncodedImage")
 			return
 		}
+		vs.stats.bytesReceived.Add(int64(len(lazyImage.RawData())))
 		decodedImage := lazyImage.DecodedImage()
 		vs.latestFrame.Store(&decodedImage)
 	}
@@ -414,6 +468,12 @@ func (vs *videostore) deleter(ctx context.Context) {
 // is written to storage before concatenation.
 // TODO: (seanp) Optimize this to immediately run as soon as the current segment is completed.
 func (vs *videostore) asyncSave(ctx context.Context, from, to time.Time, path string) {
+	vs.stats.activeUploadConcats.Add(1)
+	defer func() {
+		vs.stats.activeUploadConcats.Add(-1)
+		vs.stats.uploadVideoConcats.Add(1)
+	}()
+
 	totalTimeout := time.Duration(asyncTimeout)*time.Second + vs.conc.segmentDur
 	ctx, cancel := context.WithTimeout(ctx, totalTimeout)
 	defer cancel()
@@ -425,6 +485,9 @@ func (vs *videostore) asyncSave(ctx context.Context, from, to time.Time, path st
 		err := vs.conc.concat(from, to, path)
 		if err != nil {
 			vs.logger.Error("failed to concat files ", err)
+		}
+		if info, err := os.Stat(path); err == nil {
+			vs.stats.bytesConcated.Add(info.Size())
 		}
 		return
 	case <-ctx.Done():
